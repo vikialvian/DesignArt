@@ -43,10 +43,21 @@ public sealed class EditorPropertiesPanel : UserControl
         Controls.Add(title);
     }
 
-    public void ShowSelection(VectorShape? shape)
+    public void ShowSelection(IReadOnlyList<VectorShape> shapes)
     {
-        _selectionLabel.Text = shape is null
-            ? "Belum ada objek dipilih"
-            : $"Objek\nJenis: {shape.Kind}\nIsi: {shape.Fill?.Name ?? "Tanpa isi"}\nGaris: {shape.Stroke.Name}";
+        if (shapes.Count == 0)
+        {
+            _selectionLabel.Text = "Belum ada objek dipilih";
+            return;
+        }
+
+        if (shapes.Count > 1)
+        {
+            _selectionLabel.Text = $"Seleksi grup\n{shapes.Count} objek dipilih";
+            return;
+        }
+
+        var shape = shapes[0];
+        _selectionLabel.Text = $"Objek\nJenis: {shape.Kind}\nIsi: {shape.Fill?.Name ?? "Tanpa isi"}\nGaris: {shape.Stroke.Name}";
     }
 }

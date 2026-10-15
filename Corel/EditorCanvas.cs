@@ -7,19 +7,25 @@ public sealed class EditorCanvas : Control
 {
     private readonly List<VectorShape> _shapes = new();
     private readonly List<PointF> _drawingPoints = new();
+    private readonly HashSet<int> _selectedShapes = new();
     private PointF _dragStart;
     private PointF _dragEnd;
+    private PointF _marqueeStart;
+    private PointF _marqueeEnd;
     private Point _panStart;
     private PointF _originAtPan;
     private PointF? _pageOrigin;
     private PointF _transformStart;
-    private VectorShape? _transformSource;
+    private RectangleF _transformBounds;
+    private readonly List<(int Index, VectorShape Shape)> _transformSources = new();
     private float _zoom = 1F;
     private int _selectedShape = -1;
     private int _resizeHandle = -1;
     private bool _isDrawing;
     private bool _isPanning;
     private bool _isTransforming;
+    private bool _isMarqueeSelecting;
+    private bool _marqueeAdditive;
     private TransformMode _transformMode;
 
     [Browsable(false)]
@@ -39,7 +45,7 @@ public sealed class EditorCanvas : Control
     public int ZoomPercent => (int)Math.Round(_zoom * 100F);
 
     public event Action<string>? StatusChanged;
-    public event Action<VectorShape?>? SelectionChanged;
+    public event Action<IReadOnlyList<VectorShape>>? SelectionChanged;
     public event Action<int>? ZoomChanged;
 
     public EditorCanvas()
@@ -58,20 +64,24 @@ public sealed class EditorCanvas : Control
     public void ClearDocument()
     {
         _shapes.Clear();
+        _selectedShapes.Clear();
         _selectedShape = -1;
-        SelectionChanged?.Invoke(null);
+        RaiseSelectionChanged();
         StatusChanged?.Invoke("Dokumen baru");
         Invalidate();
     }
 
     public void DeleteSelection()
     {
-        if (_selectedShape < 0 || _selectedShape >= _shapes.Count)
+        if (_selectedShapes.Count == 0)
             return;
 
-        _shapes.RemoveAt(_selectedShape);
+        foreach (var index in _selectedShapes.OrderByDescending(index => index))
+            _shapes.RemoveAt(index);
+
+        _selectedShapes.Clear();
         _selectedShape = -1;
-        SelectionChanged?.Invoke(null);
+        RaiseSelectionChanged();
         StatusChanged?.Invoke("Objek dihapus");
         Invalidate();
     }
@@ -122,8 +132,14 @@ public sealed class EditorCanvas : Control
         using (var border = new Pen(Color.FromArgb(205, 207, 210)))
             graphics.DrawRectangle(border, page.X, page.Y, page.Width, page.Height);
 
-        for (var i = 0; i < _shapes.Count; i++)
-            DrawShape(graphics, _shapes[i], page, i == _selectedShape);
+        foreach (var shape in _shapes)
+            DrawShape(graphics, shape, page, false);
+
+        if (_selectedShapes.Count > 0)
+            DrawSelectionHandles(graphics, ToPageBounds(GetCombinedBounds(), page));
+
+        if (_isMarqueeSelecting)
+            DrawMarquee(graphics, page);
 
         if (_isDrawing)
             DrawShape(graphics, CreateCurrentShape(), page, false);
@@ -166,24 +182,58 @@ public sealed class EditorCanvas : Control
         var point = ToNormalizedPoint(e.Location, page);
         if (ActiveTool == EditorTool.Select)
         {
-            var handle = GetHandleAt(e.Location);
-            if (handle >= 0 && _selectedShape >= 0)
+            var shiftPressed = (ModifierKeys & Keys.Shift) == Keys.Shift;
+            var handle = shiftPressed ? -1 : GetHandleAt(e.Location);
+            if (handle >= 0 && _selectedShapes.Count > 0)
             {
                 BeginTransform(TransformMode.Resize, point, handle);
                 return;
             }
 
-            _selectedShape = FindShape(point);
-            var selected = _selectedShape >= 0 ? _shapes[_selectedShape] : null;
-            SelectionChanged?.Invoke(selected);
-            if (selected is not null)
+            var hitShape = FindShape(point);
+            if (hitShape >= 0)
             {
+                if (shiftPressed)
+                {
+                    if (!_selectedShapes.Add(hitShape))
+                    {
+                        _selectedShapes.Remove(hitShape);
+                        _selectedShape = _selectedShapes.Count == 0 ? -1 : _selectedShapes.Last();
+                        RaiseSelectionChanged();
+                        StatusChanged?.Invoke(_selectedShapes.Count == 0
+                            ? "Seleksi kosong"
+                            : $"{_selectedShapes.Count} objek dipilih");
+                        Invalidate();
+                        return;
+                    }
+                }
+                else if (!_selectedShapes.Contains(hitShape))
+                {
+                    _selectedShapes.Clear();
+                    _selectedShapes.Add(hitShape);
+                }
+
+                _selectedShape = hitShape;
+                RaiseSelectionChanged();
                 BeginTransform(TransformMode.Move, point, -1);
-                StatusChanged?.Invoke("Objek dipilih — seret untuk memindahkan");
+                StatusChanged?.Invoke(_selectedShapes.Count > 1
+                    ? $"{_selectedShapes.Count} objek dipilih — seret untuk memindahkan"
+                    : "Objek dipilih — seret untuk memindahkan");
             }
             else
             {
-                StatusChanged?.Invoke("Tidak ada objek dipilih");
+                if (!shiftPressed)
+                {
+                    _selectedShapes.Clear();
+                    _selectedShape = -1;
+                    RaiseSelectionChanged();
+                }
+
+                _marqueeStart = point;
+                _marqueeEnd = point;
+                _marqueeAdditive = shiftPressed;
+                _isMarqueeSelecting = true;
+                Capture = true;
             }
             Invalidate();
             return;
@@ -218,6 +268,13 @@ public sealed class EditorCanvas : Control
         if (_isTransforming)
         {
             UpdateTransform(ToNormalizedPoint(e.Location, GetPageBounds()));
+            Invalidate();
+            return;
+        }
+
+        if (_isMarqueeSelecting)
+        {
+            _marqueeEnd = ToNormalizedPoint(e.Location, GetPageBounds());
             Invalidate();
             return;
         }
@@ -262,11 +319,20 @@ public sealed class EditorCanvas : Control
         {
             _isTransforming = false;
             Capture = false;
-            var selected = _selectedShape >= 0 ? _shapes[_selectedShape] : null;
-            SelectionChanged?.Invoke(selected);
+            RaiseSelectionChanged();
             StatusChanged?.Invoke(_transformMode == TransformMode.Move ? "Objek dipindahkan" : "Ukuran objek diubah");
-            _transformSource = null;
+            _transformSources.Clear();
             UpdateSelectionCursor(e.Location);
+            Invalidate();
+            return;
+        }
+
+        if (_isMarqueeSelecting && e.Button == MouseButtons.Left)
+        {
+            _marqueeEnd = ToNormalizedPoint(e.Location, GetPageBounds());
+            CompleteMarqueeSelection();
+            _isMarqueeSelecting = false;
+            Capture = false;
             Invalidate();
             return;
         }
@@ -285,7 +351,9 @@ public sealed class EditorCanvas : Control
         {
             _shapes.Add(shape);
             _selectedShape = _shapes.Count - 1;
-            SelectionChanged?.Invoke(shape);
+            _selectedShapes.Clear();
+            _selectedShapes.Add(_selectedShape);
+            RaiseSelectionChanged();
             StatusChanged?.Invoke("Objek dibuat");
         }
         Invalidate();
@@ -296,7 +364,10 @@ public sealed class EditorCanvas : Control
         _transformMode = mode;
         _resizeHandle = handle;
         _transformStart = start;
-        _transformSource = _shapes[_selectedShape];
+        _transformBounds = GetCombinedBounds();
+        _transformSources.Clear();
+        foreach (var index in _selectedShapes.OrderBy(index => index))
+            _transformSources.Add((index, _shapes[index]));
         _isTransforming = true;
         Capture = true;
         Cursor = mode == TransformMode.Move ? Cursors.SizeAll : GetResizeCursor(handle);
@@ -304,39 +375,50 @@ public sealed class EditorCanvas : Control
 
     private void UpdateTransform(PointF current)
     {
-        if (_transformSource is null || _selectedShape < 0)
+        if (_transformSources.Count == 0)
             return;
 
-        var source = _transformSource;
         if (_transformMode == TransformMode.Move)
         {
             var delta = new PointF(current.X - _transformStart.X, current.Y - _transformStart.Y);
-            var movedBounds = new RectangleF(
-                source.Bounds.X + delta.X,
-                source.Bounds.Y + delta.Y,
-                source.Bounds.Width,
-                source.Bounds.Height);
-            var movedPoints = source.Points
-                .Select(point => new PointF(point.X + delta.X, point.Y + delta.Y))
-                .ToList();
-            _shapes[_selectedShape] = CopyShape(source, movedBounds, movedPoints, source.TextScale);
+            foreach (var (index, source) in _transformSources)
+            {
+                var movedBounds = new RectangleF(
+                    source.Bounds.X + delta.X,
+                    source.Bounds.Y + delta.Y,
+                    source.Bounds.Width,
+                    source.Bounds.Height);
+                var movedPoints = source.Points
+                    .Select(point => new PointF(point.X + delta.X, point.Y + delta.Y))
+                    .ToList();
+                _shapes[index] = CopyShape(source, movedBounds, movedPoints, source.TextScale);
+            }
             return;
         }
 
-        var resizedBounds = ResizeBounds(source.Bounds, current, _resizeHandle);
-        var sourceWidth = Math.Max(Math.Abs(source.Bounds.Width), 0.0001F);
-        var sourceHeight = Math.Max(Math.Abs(source.Bounds.Height), 0.0001F);
-        var scaleX = resizedBounds.Width / sourceWidth;
-        var scaleY = resizedBounds.Height / sourceHeight;
-        var resizedPoints = source.Points.Select(point => new PointF(
-            resizedBounds.Left + (point.X - source.Bounds.Left) / sourceWidth * resizedBounds.Width,
-            resizedBounds.Top + (point.Y - source.Bounds.Top) / sourceHeight * resizedBounds.Height)).ToList();
+        var resizedGroup = ResizeBounds(_transformBounds, current, _resizeHandle);
+        var groupWidth = Math.Max(Math.Abs(_transformBounds.Width), 0.0001F);
+        var groupHeight = Math.Max(Math.Abs(_transformBounds.Height), 0.0001F);
+        var scaleX = resizedGroup.Width / groupWidth;
+        var scaleY = resizedGroup.Height / groupHeight;
 
-        _shapes[_selectedShape] = CopyShape(
-            source,
-            resizedBounds,
-            resizedPoints,
-            source.TextScale * Math.Max(scaleX, scaleY));
+        foreach (var (index, source) in _transformSources)
+        {
+            var resizedBounds = new RectangleF(
+                resizedGroup.Left + (source.Bounds.Left - _transformBounds.Left) * scaleX,
+                resizedGroup.Top + (source.Bounds.Top - _transformBounds.Top) * scaleY,
+                source.Bounds.Width * scaleX,
+                source.Bounds.Height * scaleY);
+            var resizedPoints = source.Points.Select(point => new PointF(
+                resizedGroup.Left + (point.X - _transformBounds.Left) * scaleX,
+                resizedGroup.Top + (point.Y - _transformBounds.Top) * scaleY)).ToList();
+
+            _shapes[index] = CopyShape(
+                source,
+                resizedBounds,
+                resizedPoints,
+                source.TextScale * Math.Max(scaleX, scaleY));
+        }
     }
 
     private static RectangleF ResizeBounds(RectangleF source, PointF current, int handle)
@@ -385,8 +467,8 @@ public sealed class EditorCanvas : Control
             return;
         }
 
-        if (_selectedShape >= 0 && _selectedShape < _shapes.Count &&
-            ToPageBounds(_shapes[_selectedShape].Bounds, GetPageBounds()).Contains(point))
+        if (_selectedShapes.Count > 0 &&
+            ToPageBounds(GetCombinedBounds(), GetPageBounds()).Contains(point))
         {
             Cursor = Cursors.SizeAll;
             return;
@@ -397,10 +479,10 @@ public sealed class EditorCanvas : Control
 
     private int GetHandleAt(Point point)
     {
-        if (_selectedShape < 0 || _selectedShape >= _shapes.Count)
+        if (_selectedShapes.Count == 0)
             return -1;
 
-        var bounds = ToPageBounds(_shapes[_selectedShape].Bounds, GetPageBounds());
+        var bounds = ToPageBounds(GetCombinedBounds(), GetPageBounds());
         var handles = GetHandlePoints(GetHandleBounds(bounds));
         for (var i = 0; i < handles.Length; i++)
         {
@@ -422,6 +504,84 @@ public sealed class EditorCanvas : Control
             1 or 5 => Cursors.SizeNS,
             _ => Cursors.SizeWE
         };
+    }
+
+    private RectangleF GetCombinedBounds()
+    {
+        var indices = _selectedShapes.Where(index => index >= 0 && index < _shapes.Count).ToArray();
+        if (indices.Length == 0)
+            return RectangleF.Empty;
+
+        var bounds = _shapes[indices[0]].Bounds;
+        for (var i = 1; i < indices.Length; i++)
+            bounds = RectangleF.Union(bounds, _shapes[indices[i]].Bounds);
+        return bounds;
+    }
+
+    private void RaiseSelectionChanged()
+    {
+        var selected = _selectedShapes
+            .Where(index => index >= 0 && index < _shapes.Count)
+            .OrderBy(index => index)
+            .Select(index => _shapes[index])
+            .ToArray();
+        SelectionChanged?.Invoke(selected);
+    }
+
+    private void CompleteMarqueeSelection()
+    {
+        var bounds = new RectangleF(
+            Math.Min(_marqueeStart.X, _marqueeEnd.X),
+            Math.Min(_marqueeStart.Y, _marqueeEnd.Y),
+            Math.Abs(_marqueeEnd.X - _marqueeStart.X),
+            Math.Abs(_marqueeEnd.Y - _marqueeStart.Y));
+
+        if (bounds.Width > 0.002F || bounds.Height > 0.002F)
+        {
+            if (!_marqueeAdditive)
+                _selectedShapes.Clear();
+
+            var leftToRight = _marqueeEnd.X >= _marqueeStart.X;
+            for (var i = 0; i < _shapes.Count; i++)
+            {
+                var shapeBounds = _shapes[i].Bounds;
+                var isHit = leftToRight
+                    ? bounds.Contains(shapeBounds)
+                    : bounds.IntersectsWith(shapeBounds);
+                if (isHit)
+                {
+                    _selectedShapes.Add(i);
+                    _selectedShape = i;
+                }
+            }
+        }
+
+        if (_selectedShapes.Count == 0)
+            _selectedShape = -1;
+        else if (!_selectedShapes.Contains(_selectedShape))
+            _selectedShape = _selectedShapes.Last();
+
+        RaiseSelectionChanged();
+        StatusChanged?.Invoke(_selectedShapes.Count == 0
+            ? "Seleksi kosong"
+            : $"{_selectedShapes.Count} objek dipilih");
+    }
+
+    private void DrawMarquee(Graphics graphics, RectangleF page)
+    {
+        var normalizedBounds = new RectangleF(
+            Math.Min(_marqueeStart.X, _marqueeEnd.X),
+            Math.Min(_marqueeStart.Y, _marqueeEnd.Y),
+            Math.Abs(_marqueeEnd.X - _marqueeStart.X),
+            Math.Abs(_marqueeEnd.Y - _marqueeStart.Y));
+        var bounds = ToPageBounds(normalizedBounds, page);
+        using var fill = new SolidBrush(Color.FromArgb(35, 65, 145, 230));
+        using var outline = new Pen(Color.FromArgb(65, 145, 230), 1F)
+        {
+            DashStyle = System.Drawing.Drawing2D.DashStyle.Dash
+        };
+        graphics.FillRectangle(fill, bounds);
+        graphics.DrawRectangle(outline, bounds.X, bounds.Y, bounds.Width, bounds.Height);
     }
 
     private void ZoomAt(float factor, Point anchor)
@@ -459,7 +619,9 @@ public sealed class EditorCanvas : Control
         };
         _shapes.Add(shape);
         _selectedShape = _shapes.Count - 1;
-        SelectionChanged?.Invoke(shape);
+        _selectedShapes.Clear();
+        _selectedShapes.Add(_selectedShape);
+        RaiseSelectionChanged();
         StatusChanged?.Invoke("Teks ditambahkan");
         Invalidate();
     }

@@ -66,7 +66,7 @@ public sealed class EditorToolbar : UserControl
 
         buttons.Controls.Add(CreateButton(EditorIconKind.NewDocument, "Baru", () => NewDocumentRequested?.Invoke()));
         buttons.Controls.Add(CreateButton(EditorIconKind.Save, "Simpan", () => SaveRequested?.Invoke()));
-        buttons.Controls.Add(CreateButton(EditorIconKind.Select, "Pilih", () => ToolSelected?.Invoke(EditorTool.Select)));
+        buttons.Controls.Add(CreateButton(EditorIconKind.Select, "Pilih — Shift+klik tambah/hapus; seret untuk seleksi area", () => ToolSelected?.Invoke(EditorTool.Select)));
         buttons.Controls.Add(CreateButton(EditorIconKind.Pan, "Pan — klik kiri tahan lalu seret", () => ToolSelected?.Invoke(EditorTool.Pan)));
         buttons.Controls.Add(CreateButton(EditorIconKind.Rectangle, "Persegi", () => ToolSelected?.Invoke(EditorTool.Rectangle)));
         buttons.Controls.Add(CreateButton(EditorIconKind.Ellipse, "Elips", () => ToolSelected?.Invoke(EditorTool.Ellipse)));

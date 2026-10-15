@@ -19,7 +19,7 @@ public sealed class EditorToolbox : UserControl
             BackColor = BackColor
         };
 
-        AddTool(tools, EditorIconKind.Select, "Pilih", EditorTool.Select);
+        AddTool(tools, EditorIconKind.Select, "Pilih — Shift+klik tambah/hapus; seret untuk seleksi area", EditorTool.Select);
         AddTool(tools, EditorIconKind.Pan, "Pan — klik kiri tahan lalu seret", EditorTool.Pan);
         AddTool(tools, EditorIconKind.Rectangle, "Persegi", EditorTool.Rectangle);
         AddTool(tools, EditorIconKind.Ellipse, "Elips", EditorTool.Ellipse);
