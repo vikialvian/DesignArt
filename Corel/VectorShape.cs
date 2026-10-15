@@ -18,5 +18,6 @@ public sealed class VectorShape
     public Color? Fill { get; init; }
     public Color Stroke { get; init; } = Color.Black;
     public float StrokeWidth { get; init; } = 1.25F;
+    public float TextScale { get; init; } = 1F;
     public string Text { get; init; } = string.Empty;
 }

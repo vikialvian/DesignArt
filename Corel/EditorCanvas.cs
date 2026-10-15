@@ -12,10 +12,15 @@ public sealed class EditorCanvas : Control
     private Point _panStart;
     private PointF _originAtPan;
     private PointF? _pageOrigin;
+    private PointF _transformStart;
+    private VectorShape? _transformSource;
     private float _zoom = 1F;
     private int _selectedShape = -1;
+    private int _resizeHandle = -1;
     private bool _isDrawing;
     private bool _isPanning;
+    private bool _isTransforming;
+    private TransformMode _transformMode;
 
     [Browsable(false)]
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
@@ -161,9 +166,25 @@ public sealed class EditorCanvas : Control
         var point = ToNormalizedPoint(e.Location, page);
         if (ActiveTool == EditorTool.Select)
         {
+            var handle = GetHandleAt(e.Location);
+            if (handle >= 0 && _selectedShape >= 0)
+            {
+                BeginTransform(TransformMode.Resize, point, handle);
+                return;
+            }
+
             _selectedShape = FindShape(point);
-            SelectionChanged?.Invoke(_selectedShape >= 0 ? _shapes[_selectedShape] : null);
-            StatusChanged?.Invoke(_selectedShape >= 0 ? "Objek dipilih" : "Tidak ada objek dipilih");
+            var selected = _selectedShape >= 0 ? _shapes[_selectedShape] : null;
+            SelectionChanged?.Invoke(selected);
+            if (selected is not null)
+            {
+                BeginTransform(TransformMode.Move, point, -1);
+                StatusChanged?.Invoke("Objek dipilih — seret untuk memindahkan");
+            }
+            else
+            {
+                StatusChanged?.Invoke("Tidak ada objek dipilih");
+            }
             Invalidate();
             return;
         }
@@ -194,8 +215,18 @@ public sealed class EditorCanvas : Control
             return;
         }
 
-        if (!_isDrawing)
+        if (_isTransforming)
+        {
+            UpdateTransform(ToNormalizedPoint(e.Location, GetPageBounds()));
+            Invalidate();
             return;
+        }
+
+        if (!_isDrawing)
+        {
+            UpdateSelectionCursor(e.Location);
+            return;
+        }
 
         _dragEnd = ToNormalizedPoint(e.Location, GetPageBounds());
         if (ActiveTool == EditorTool.Freehand)
@@ -227,6 +258,19 @@ public sealed class EditorCanvas : Control
             return;
         }
 
+        if (_isTransforming && e.Button == MouseButtons.Left)
+        {
+            _isTransforming = false;
+            Capture = false;
+            var selected = _selectedShape >= 0 ? _shapes[_selectedShape] : null;
+            SelectionChanged?.Invoke(selected);
+            StatusChanged?.Invoke(_transformMode == TransformMode.Move ? "Objek dipindahkan" : "Ukuran objek diubah");
+            _transformSource = null;
+            UpdateSelectionCursor(e.Location);
+            Invalidate();
+            return;
+        }
+
         if (!_isDrawing)
             return;
 
@@ -245,6 +289,139 @@ public sealed class EditorCanvas : Control
             StatusChanged?.Invoke("Objek dibuat");
         }
         Invalidate();
+    }
+
+    private void BeginTransform(TransformMode mode, PointF start, int handle)
+    {
+        _transformMode = mode;
+        _resizeHandle = handle;
+        _transformStart = start;
+        _transformSource = _shapes[_selectedShape];
+        _isTransforming = true;
+        Capture = true;
+        Cursor = mode == TransformMode.Move ? Cursors.SizeAll : GetResizeCursor(handle);
+    }
+
+    private void UpdateTransform(PointF current)
+    {
+        if (_transformSource is null || _selectedShape < 0)
+            return;
+
+        var source = _transformSource;
+        if (_transformMode == TransformMode.Move)
+        {
+            var delta = new PointF(current.X - _transformStart.X, current.Y - _transformStart.Y);
+            var movedBounds = new RectangleF(
+                source.Bounds.X + delta.X,
+                source.Bounds.Y + delta.Y,
+                source.Bounds.Width,
+                source.Bounds.Height);
+            var movedPoints = source.Points
+                .Select(point => new PointF(point.X + delta.X, point.Y + delta.Y))
+                .ToList();
+            _shapes[_selectedShape] = CopyShape(source, movedBounds, movedPoints, source.TextScale);
+            return;
+        }
+
+        var resizedBounds = ResizeBounds(source.Bounds, current, _resizeHandle);
+        var sourceWidth = Math.Max(Math.Abs(source.Bounds.Width), 0.0001F);
+        var sourceHeight = Math.Max(Math.Abs(source.Bounds.Height), 0.0001F);
+        var scaleX = resizedBounds.Width / sourceWidth;
+        var scaleY = resizedBounds.Height / sourceHeight;
+        var resizedPoints = source.Points.Select(point => new PointF(
+            resizedBounds.Left + (point.X - source.Bounds.Left) / sourceWidth * resizedBounds.Width,
+            resizedBounds.Top + (point.Y - source.Bounds.Top) / sourceHeight * resizedBounds.Height)).ToList();
+
+        _shapes[_selectedShape] = CopyShape(
+            source,
+            resizedBounds,
+            resizedPoints,
+            source.TextScale * Math.Max(scaleX, scaleY));
+    }
+
+    private static RectangleF ResizeBounds(RectangleF source, PointF current, int handle)
+    {
+        var left = source.Left;
+        var top = source.Top;
+        var right = source.Right;
+        var bottom = source.Bottom;
+
+        if (handle is 0 or 6 or 7) left = current.X;
+        if (handle is 2 or 3 or 4) right = current.X;
+        if (handle is 0 or 1 or 2) top = current.Y;
+        if (handle is 4 or 5 or 6) bottom = current.Y;
+
+        return new RectangleF(
+            Math.Min(left, right),
+            Math.Min(top, bottom),
+            Math.Abs(right - left),
+            Math.Abs(bottom - top));
+    }
+
+    private static VectorShape CopyShape(VectorShape source, RectangleF bounds, List<PointF> points, float textScale)
+    {
+        return new VectorShape
+        {
+            Kind = source.Kind,
+            Bounds = bounds,
+            Points = points,
+            Fill = source.Fill,
+            Stroke = source.Stroke,
+            StrokeWidth = source.StrokeWidth,
+            TextScale = Math.Max(0.05F, textScale),
+            Text = source.Text
+        };
+    }
+
+    private void UpdateSelectionCursor(Point point)
+    {
+        if (ActiveTool != EditorTool.Select)
+            return;
+
+        var handle = GetHandleAt(point);
+        if (handle >= 0)
+        {
+            Cursor = GetResizeCursor(handle);
+            return;
+        }
+
+        if (_selectedShape >= 0 && _selectedShape < _shapes.Count &&
+            ToPageBounds(_shapes[_selectedShape].Bounds, GetPageBounds()).Contains(point))
+        {
+            Cursor = Cursors.SizeAll;
+            return;
+        }
+
+        Cursor = Cursors.Default;
+    }
+
+    private int GetHandleAt(Point point)
+    {
+        if (_selectedShape < 0 || _selectedShape >= _shapes.Count)
+            return -1;
+
+        var bounds = ToPageBounds(_shapes[_selectedShape].Bounds, GetPageBounds());
+        var handles = GetHandlePoints(GetHandleBounds(bounds));
+        for (var i = 0; i < handles.Length; i++)
+        {
+            var dx = point.X - handles[i].X;
+            var dy = point.Y - handles[i].Y;
+            if (dx * dx + dy * dy <= 64F)
+                return i;
+        }
+
+        return -1;
+    }
+
+    private static Cursor GetResizeCursor(int handle)
+    {
+        return handle switch
+        {
+            0 or 4 => Cursors.SizeNWSE,
+            2 or 6 => Cursors.SizeNESW,
+            1 or 5 => Cursors.SizeNS,
+            _ => Cursors.SizeWE
+        };
     }
 
     private void ZoomAt(float factor, Point anchor)
@@ -383,7 +560,7 @@ public sealed class EditorCanvas : Control
                 break;
             case ShapeKind.Text:
                 using (var textBrush = new SolidBrush(shape.Stroke))
-                using (var font = new Font("Segoe UI", Math.Clamp(page.Width * 0.045F, 10F, 36F)))
+                using (var font = new Font("Segoe UI", Math.Clamp(page.Width * 0.045F * shape.TextScale, 6F, 128F)))
                     graphics.DrawString(shape.Text, font, textBrush, bounds.Location);
                 break;
         }
@@ -396,13 +573,40 @@ public sealed class EditorCanvas : Control
 
     private static void DrawSelectionHandles(Graphics graphics, RectangleF bounds)
     {
+        bounds = GetHandleBounds(bounds);
         using var selectionPen = new Pen(Color.FromArgb(30, 120, 220), 1.5F);
         using var handleBrush = new SolidBrush(Color.White);
         graphics.DrawRectangle(selectionPen, bounds.X - 3, bounds.Y - 3,
             bounds.Width + 6, bounds.Height + 6);
 
-        var handlePoints = new[]
+        foreach (var point in GetHandlePoints(bounds))
         {
+            var handle = new RectangleF(point.X - 3.5F, point.Y - 3.5F, 7F, 7F);
+            graphics.FillRectangle(handleBrush, handle);
+            graphics.DrawRectangle(selectionPen, handle.X, handle.Y, handle.Width, handle.Height);
+        }
+    }
+
+    private static RectangleF GetHandleBounds(RectangleF bounds)
+    {
+        const float minimumSize = 10F;
+        if (bounds.Width < minimumSize)
+        {
+            bounds.X -= (minimumSize - bounds.Width) / 2F;
+            bounds.Width = minimumSize;
+        }
+        if (bounds.Height < minimumSize)
+        {
+            bounds.Y -= (minimumSize - bounds.Height) / 2F;
+            bounds.Height = minimumSize;
+        }
+        return bounds;
+    }
+
+    private static PointF[] GetHandlePoints(RectangleF bounds)
+    {
+        return
+        [
             new PointF(bounds.Left, bounds.Top),
             new PointF(bounds.Left + bounds.Width / 2F, bounds.Top),
             new PointF(bounds.Right, bounds.Top),
@@ -411,14 +615,7 @@ public sealed class EditorCanvas : Control
             new PointF(bounds.Left + bounds.Width / 2F, bounds.Bottom),
             new PointF(bounds.Left, bounds.Bottom),
             new PointF(bounds.Left, bounds.Top + bounds.Height / 2F)
-        };
-
-        foreach (var point in handlePoints)
-        {
-            var handle = new RectangleF(point.X - 3.5F, point.Y - 3.5F, 7F, 7F);
-            graphics.FillRectangle(handleBrush, handle);
-            graphics.DrawRectangle(selectionPen, handle.X, handle.Y, handle.Width, handle.Height);
-        }
+        ];
     }
 
     private static PointF ToPagePoint(PointF point, RectangleF page)
@@ -461,5 +658,11 @@ public sealed class EditorCanvas : Control
             Math.Max(1F, ClientSize.Height - 70F) / pageHeight);
         scale = Math.Clamp(scale, 0.05F, 1F) * _zoom;
         return new SizeF(pageWidth * scale, pageHeight * scale);
+    }
+
+    private enum TransformMode
+    {
+        Move,
+        Resize
     }
 }
